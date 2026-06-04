@@ -73,12 +73,12 @@ final class VoiceSession {
         volatileText = ""
         allWords = []
 
-        // 1. 查找最佳中文 locale
-        let bestLocale = await findChineseLocale()
+        // 1. 查找最佳 locale（从 config 读取，支持热更新）
+        let preferredLocale = RuntimeConfig.shared.speechLocale
+        let bestLocale = await findLocale(preferred: preferredLocale)
         guard let bestLocale else {
             throw VoiceError.recognizerUnavailable
         }
-        Logger.log("Voice", "Using locale: \(bestLocale.identifier(.bcp47))")
 
         // 2. 配置 SpeechTranscriber（volatile 给 UI 实时回显，confidence 给服务端蒸馏用）
         let transcriber = SpeechTranscriber(
@@ -248,31 +248,42 @@ final class VoiceSession {
         let totalStopTime = CFAbsoluteTimeGetCurrent() - stopT0
         let lastWordEnd = allWords.last.map { $0.startTime + $0.duration } ?? 0
         Logger.log("Voice", "[DIAG] stop: SUMMARY | total=\(String(format: "%.3f", totalStopTime))s | timedOut=\(finalizeTimedOut) | finalizedText=\(finalizedText.count)字 | volatileText=\(volatileText.count)字 | fullText=\(fullText.count)字 | lastWordEnd=\(String(format: "%.1f", lastWordEnd))s | words=\(allWords.count)")
-        Logger.log("Voice", "Session stopped, text: \(fullText)")
-
-        return TranscriptionResult(
+        let firstResult = TranscriptionResult(
             fullText: fullText,
             words: allWords,
             audioPath: audioFileURL?.path,
             timestamp: Date()
         )
+        Logger.log("Voice", "Session stopped, text: \(fullText)")
+
+        if let secondResult = await secondPassIfNeeded(firstResult) {
+            return secondResult
+        }
+        return firstResult
     }
 
     // MARK: - Locale 查找
 
-    private func findChineseLocale() async -> Locale? {
+    private func findLocale(preferred identifier: String) async -> Locale? {
         let supported = await SpeechTranscriber.supportedLocales
         let ids = supported.map { $0.identifier(.bcp47) }
         Logger.log("Voice", "Supported locales: \(ids)")
 
-        let prefixes = ["zh-Hans", "zh-CN", "zh-Hant", "zh"]
-        for prefix in prefixes {
+        if let match = supported.first(where: { $0.identifier(.bcp47).hasPrefix(identifier) }) {
+            Logger.log("Voice", "Using locale: \(match.identifier(.bcp47))")
+            return match
+        }
+
+        // fall back to Chinese if preferred locale not installed
+        Logger.log("Voice", "Locale '\(identifier)' not found, falling back to zh-CN")
+        let chinesePrefixes = ["zh-Hans", "zh-CN", "zh-Hant", "zh"]
+        for prefix in chinesePrefixes {
             if let match = supported.first(where: { $0.identifier(.bcp47).hasPrefix(prefix) }) {
                 return match
             }
         }
 
-        Logger.log("Voice", "No Chinese locale found")
+        Logger.log("Voice", "No suitable locale found")
         return nil
     }
 
@@ -299,6 +310,185 @@ final class VoiceSession {
             ))
         }
         return words
+    }
+
+    // MARK: - 二次识别（语言不匹配时从 WAV 重新识别）
+
+    /// Returns "en", "zh", or nil if text is too short to determine.
+    private func detectLanguage(_ text: String) -> String? {
+        var latin = 0, cjk = 0
+        for scalar in text.unicodeScalars {
+            let v = scalar.value
+            if (v >= 0x41 && v <= 0x5A) || (v >= 0x61 && v <= 0x7A) { latin += 1 }
+            else if (v >= 0x4E00 && v <= 0x9FFF) || (v >= 0x3400 && v <= 0x4DBF) { cjk += 1 }
+        }
+        guard latin + cjk >= 5 else { return nil }
+        return latin > cjk ? "en" : "zh"
+    }
+
+    /// Checks if first-pass result needs a second pass with the opposite locale.
+    /// Triggers on:
+    ///   1. Empty transcription: recognizer produced nothing (wrong locale, strong mismatch)
+    ///   2. Text-based mismatch: detected script differs from configured locale
+    ///   3. Confidence-based: low confidence + high word repetition (Chinese phonetics
+    ///      through en-US produce repeated syllable-words like "go, go, go")
+    private func secondPassIfNeeded(_ first: TranscriptionResult) async -> TranscriptionResult? {
+        guard let audioPath = first.audioPath else { return nil }
+
+        let configured = RuntimeConfig.shared.speechLocale
+        let configuredFamily = configured.hasPrefix("zh") ? "zh" : "en"
+        let secondLocaleID = configuredFamily == "en" ? "zh-CN" : "en-US"
+        let text = first.fullText.trimmingCharacters(in: .whitespaces)
+
+        // Case 1: recognizer produced nothing — almost certainly a locale mismatch
+        if text.isEmpty {
+            Logger.log("Voice", "Second pass: empty transcription → \(secondLocaleID)")
+            guard let locale = await findLocale(preferred: secondLocaleID),
+                  let second = await transcribeFile(URL(fileURLWithPath: audioPath), locale: locale, original: first)
+            else { return nil }
+            if secondLocaleID.hasPrefix("zh") {
+                let hasCJK = second.fullText.unicodeScalars.contains { $0.value >= 0x4E00 && $0.value <= 0x9FFF }
+                guard hasCJK else {
+                    Logger.log("Voice", "Second pass (zh-CN) rejected: no CJK in output")
+                    return nil
+                }
+            }
+            return second
+        }
+
+        let detected = detectLanguage(text)
+        let textMismatch = detected != nil && detected != configuredFamily
+
+        let avgConfidence = first.words.isEmpty ? 1.0 :
+            Double(first.words.map(\.confidence).reduce(0, +)) / Double(first.words.count)
+
+        let repetitionRatio: Double = {
+            guard !first.words.isEmpty else { return 0 }
+            let normalized = first.words
+                .map { $0.text.trimmingCharacters(in: .punctuationCharacters).lowercased() }
+                .filter { $0.count > 1 }
+            guard !normalized.isEmpty else { return 1 }
+            return 1.0 - Double(Set(normalized).count) / Double(normalized.count)
+        }()
+
+        let lowConfidence = !first.words.isEmpty
+            && avgConfidence < 0.35
+            && (avgConfidence < 0.27 || repetitionRatio > 0.25)
+
+        guard textMismatch || lowConfidence else { return nil }
+
+        Logger.log("Voice", "Second pass: textMismatch=\(textMismatch) avgConf=\(String(format: "%.2f", avgConfidence)) rep=\(String(format: "%.2f", repetitionRatio)) → \(secondLocaleID)")
+
+        guard let locale = await findLocale(preferred: secondLocaleID) else { return nil }
+        guard let second = await transcribeFile(URL(fileURLWithPath: audioPath), locale: locale, original: first) else { return nil }
+
+        // For a zh-CN second pass, only accept if it actually contains CJK characters
+        // (guards against triggering on low-confidence English speech)
+        if secondLocaleID.hasPrefix("zh") {
+            let hasCJK = second.fullText.unicodeScalars.contains { $0.value >= 0x4E00 && $0.value <= 0x9FFF }
+            guard hasCJK else {
+                Logger.log("Voice", "Second pass (zh-CN) rejected: no CJK in output, keeping first pass")
+                return nil
+            }
+        }
+
+        return second
+    }
+
+    /// Re-transcribes a saved WAV file with a different locale.
+    private func transcribeFile(_ url: URL, locale: Locale, original: TranscriptionResult) async -> TranscriptionResult? {
+        let t0 = CFAbsoluteTimeGetCurrent()
+
+        let transcriber = SpeechTranscriber(
+            locale: locale,
+            transcriptionOptions: [],
+            reportingOptions: [],
+            attributeOptions: [.audioTimeRange, .transcriptionConfidence]
+        )
+
+        // skip if model not installed — don't trigger a download mid-session
+        let installed = await SpeechTranscriber.installedLocales
+        let localeID = locale.identifier(.bcp47)
+        guard installed.contains(where: { $0.identifier(.bcp47).hasPrefix(localeID) }) else {
+            Logger.log("Voice", "Second pass skipped: \(localeID) model not installed")
+            return nil
+        }
+
+        let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
+        let analyzer = SpeechAnalyzer(
+            modules: [transcriber],
+            options: .init(priority: .userInitiated, modelRetention: .processLifetime)
+        )
+        do { try await analyzer.prepareToAnalyze(in: analyzerFormat) } catch { return nil }
+
+        let (inputSeq, inputCont) = AsyncStream<AnalyzerInput>.makeStream()
+        do { try await analyzer.start(inputSequence: inputSeq) } catch { return nil }
+
+        // collect transcription results
+        var resultText = ""
+        var resultWords: [WordInfo] = []
+        let collectTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                for try await result in transcriber.results where result.isFinal {
+                    resultText += String(result.text.characters)
+                    resultWords += self.extractWords(from: result.text)
+                }
+            } catch {}
+        }
+
+        // feed audio from WAV into the new analyzer
+        if let audioFile = try? AVAudioFile(forReading: url), let targetFormat = analyzerFormat {
+            let fileFormat = audioFile.processingFormat
+            let needsConversion = fileFormat.sampleRate != targetFormat.sampleRate
+                || fileFormat.commonFormat != targetFormat.commonFormat
+                || fileFormat.channelCount != targetFormat.channelCount
+            let converter = needsConversion ? AVAudioConverter(from: fileFormat, to: targetFormat) : nil
+            let chunkFrames: AVAudioFrameCount = 4096
+
+            feedLoop: while true {
+                guard let readBuf = AVAudioPCMBuffer(pcmFormat: fileFormat, frameCapacity: chunkFrames) else { break }
+                do { try audioFile.read(into: readBuf) } catch { break }
+                guard readBuf.frameLength > 0 else { break }
+
+                let outBuf: AVAudioPCMBuffer
+                if let conv = converter {
+                    let ratio = targetFormat.sampleRate / fileFormat.sampleRate
+                    let cap = AVAudioFrameCount(Double(readBuf.frameLength) * ratio) + 1
+                    guard let converted = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: cap) else { break feedLoop }
+                    var consumed = false
+                    conv.convert(to: converted, error: nil) { _, status in
+                        if consumed { status.pointee = .noDataNow; return nil }
+                        consumed = true; status.pointee = .haveData; return readBuf
+                    }
+                    guard converted.frameLength > 0 else { continue }
+                    outBuf = converted
+                } else {
+                    outBuf = readBuf
+                }
+                inputCont.yield(AnalyzerInput(buffer: outBuf))
+            }
+        }
+        inputCont.finish()
+
+        do {
+            try await withThrowingTimeout(seconds: 10) {
+                try await analyzer.finalizeAndFinishThroughEndOfInput()
+            }
+        } catch {}
+        try? await Task.sleep(for: .milliseconds(300))
+        collectTask.cancel()
+
+        let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
+        Logger.log("Voice", "Second pass done: locale=\(localeID) elapsedMs=\(elapsed) text=\(resultText)")
+
+        guard !resultText.isEmpty else { return nil }
+        return TranscriptionResult(
+            fullText: resultText,
+            words: resultWords,
+            audioPath: original.audioPath,
+            timestamp: original.timestamp
+        )
     }
 
     // MARK: - 模型管理

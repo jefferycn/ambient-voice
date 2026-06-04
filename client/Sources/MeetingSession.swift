@@ -99,7 +99,7 @@ final class MeetingSession {
 
         do {
             // 1. 配置 SpeechTranscriber（和 start() 完全一致）
-            let bestLocale = await findChineseLocale() ?? localeObj
+            let bestLocale = await findLocale(preferred: RuntimeConfig.shared.speechLocale) ?? localeObj
             Logger.log("Meeting", "[Bench] Using locale: \(bestLocale.identifier(.bcp47))")
 
             let transcriber = SpeechTranscriber(
@@ -261,8 +261,9 @@ final class MeetingSession {
         resetL2Stats()
         setupSegmentBuffer()
 
-        // 1. 查找最佳中文 locale
-        let bestLocale = await findChineseLocale()
+        // 1. 查找最佳 locale（从 config 读取，支持热更新）
+        let preferredLocale = RuntimeConfig.shared.speechLocale
+        let bestLocale = await findLocale(preferred: preferredLocale)
         guard let bestLocale else {
             throw VoiceError.recognizerUnavailable
         }
@@ -858,15 +859,22 @@ final class MeetingSession {
 
     // MARK: - Locale 查找（与 VoiceSession 相同）
 
-    private func findChineseLocale() async -> Locale? {
+    private func findLocale(preferred identifier: String) async -> Locale? {
         let supported = await SpeechTranscriber.supportedLocales
-        let prefixes = ["zh-Hans", "zh-CN", "zh-Hant", "zh"]
-        for prefix in prefixes {
+
+        if let match = supported.first(where: { $0.identifier(.bcp47).hasPrefix(identifier) }) {
+            return match
+        }
+
+        Logger.log("Meeting", "Locale '\(identifier)' not found, falling back to zh-CN")
+        let chinesePrefixes = ["zh-Hans", "zh-CN", "zh-Hant", "zh"]
+        for prefix in chinesePrefixes {
             if let match = supported.first(where: { $0.identifier(.bcp47).hasPrefix(prefix) }) {
                 return match
             }
         }
-        Logger.log("Meeting", "No Chinese locale found")
+
+        Logger.log("Meeting", "No suitable locale found")
         return nil
     }
 

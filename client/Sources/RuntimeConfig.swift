@@ -45,6 +45,12 @@ final class RuntimeConfig {
         values["hotkey"] as? [String: Any] ?? [:]
     }
 
+    /// 语音识别语言（BCP-47），默认 zh-CN
+    /// 支持热更新：改 config.json 后下次录音生效，无需重启
+    var speechLocale: String {
+        (values["speech"] as? [String: Any])?["locale"] as? String ?? "zh-CN"
+    }
+
     /// 持久化新的 hotkey 配置（设置窗口保存时调用）
     func updateHotKeyConfig(_ dict: [String: Any]) {
         values["hotkey"] = dict
