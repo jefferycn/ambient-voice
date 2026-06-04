@@ -15,8 +15,12 @@ final class VoicePipeline {
         let rawText = transcription.fullText
         Logger.log("Pipeline", "Raw: \(rawText)")
 
-        // L1: 信任 Apple 官方排序，不做任何修改
-        let l1Text = rawText
+        // L1: normalize punctuation when English is detected (Chinese recognizer always outputs
+        // Chinese punctuation regardless of spoken language)
+        let l1Text = normalizePunctuation(rawText)
+        if l1Text != rawText {
+            Logger.log("Pipeline", "L1: punctuation normalized (English detected)")
+        }
 
         // L2: 模型润色（polish.enabled = false 时跳过）
         let finalText: String
@@ -61,5 +65,37 @@ final class VoicePipeline {
 
         let totalMs = Int((CFAbsoluteTimeGetCurrent() - tStart) * 1000)
         Logger.log("Pipeline", "Timing: l2=\(l2ElapsedMs)ms inject=\(injectMs)ms pipeline_total=\(totalMs)ms")
+    }
+
+    // Detects if text is predominantly Latin-script and converts Chinese punctuation to
+    // English equivalents. Chinese text is returned unchanged.
+    private func normalizePunctuation(_ text: String) -> String {
+        var latinCount = 0
+        var cjkCount = 0
+        for scalar in text.unicodeScalars {
+            let v = scalar.value
+            if (v >= 0x0041 && v <= 0x005A) || (v >= 0x0061 && v <= 0x007A) {
+                latinCount += 1
+            } else if (v >= 0x4E00 && v <= 0x9FFF) || (v >= 0x3400 && v <= 0x4DBF) {
+                cjkCount += 1
+            }
+        }
+        guard latinCount > cjkCount else { return text }
+
+        return text
+            .replacingOccurrences(of: "。", with: ".")
+            .replacingOccurrences(of: "，", with: ",")
+            .replacingOccurrences(of: "！", with: "!")
+            .replacingOccurrences(of: "？", with: "?")
+            .replacingOccurrences(of: "；", with: ";")
+            .replacingOccurrences(of: "：", with: ":")
+            .replacingOccurrences(of: "、", with: ",")
+            .replacingOccurrences(of: "「", with: "\"")
+            .replacingOccurrences(of: "」", with: "\"")
+            .replacingOccurrences(of: "（", with: "(")
+            .replacingOccurrences(of: "）", with: ")")
+            .replacingOccurrences(of: "【", with: "[")
+            .replacingOccurrences(of: "】", with: "]")
+            .replacingOccurrences(of: "…", with: "...")
     }
 }
